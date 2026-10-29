@@ -47,3 +47,6 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# 构建必需：internal/prompt/prompt.go 里 //go:embed 的内嵌提示词
+!internal/prompt/defaultprompt.md
