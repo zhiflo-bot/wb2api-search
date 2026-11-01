@@ -136,6 +136,9 @@ func main() {
 	}
 
 	up := upstream.New()
+	up.RefreshPaused = p.RiskPaused
+	up.OnRefreshRateLimit = func(uid string, retryAfter time.Duration) { p.PauseRefreshRateLimited(uid, retryAfter) }
+	up.OnRefreshSuccess = p.NoteRefreshSuccess
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -236,15 +239,17 @@ func main() {
 	}
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:                 p,
+		Upstream:             up,
+		APIKey:               cfg.APIKey,
+		Session:              sessRouter,
+		StickyCount:          sessCount,
+		RedisMode:            redisMode,
+		SoftCooldown:         cfg.SoftRateDur,
+		LargeRequestBytes:    cfg.Pool.LargeRequestBytes,
+		LargeRequestCooldown: cfg.LargeRequestCooldownDur,
+		PromptMode:           cfg.Prompt.Mode,
+		PromptText:           cfg.PromptText,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
