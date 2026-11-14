@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -12,18 +11,18 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// POST /v1/search/messages —— 把上游的 agenttool 联网搜索包成 Anthropic Messages
-// 形态（`web_search_20250305` 的结果块），这样 dsh 的 web-search-deepseek provider
-// 可以零改动接入：它往 `{baseURL}/messages` POST，从 `web_search_tool_result` 块里
-// 取 `web_search_result` 的 url/title。
+// POST /v1/search/messages —— 把上游 agenttool 联网搜索包成 Anthropic Messages
+// 形态（`web_search_20250305` 的结果块），供 dsh 的 web-search-deepseek provider
+// 直接接入：它往 `{baseURL}/messages` POST，从 `web_search_tool_result` 块里取
+// `web_search_result` 的 url/title。
 //
-// 与 /v1/chat/completions 的关系：共用同一套鉴权（withAuth）、选号（Pool）、在途
-// 名额（Acquire/Release）与出口线路（账号的 ProxyName）。区别是不做流式、不做
-// 会话粘性、不写用量账本 —— 搜索不消耗模型 token，没有可记的用量。
+// 上游自 v2.11.15 起自带 `POST /v1/tools/search`（原样透传 agenttool 信封）和
+// `Client.AgentToolSearch`。这里**复用它的上游调用**，只做两件它不做的事：
+// 解析 Anthropic 形态的请求、把结果包成 Anthropic 的结果块。于是我们对上游的
+// diff 只剩本文件 + handler.go 的一行路由。
 //
-// 请求体两种形态都收：
-//   - {"query":"...","max_results":10}                       直接给查询词
-//   - Anthropic Messages 形态（{"model","tools","messages"}）  取最后一条 user 文本
+// 与 /v1/chat/completions 共用鉴权（withAuth）、选号（Pool）与在途名额；不做
+// 会话粘性（搜索无上下文，粘住单号会把该号的搜索日配额打穿）。
 const searchMessagesPath = "/v1/search/messages"
 
 // searchQueryPrefix dsh 的 provider 会这样包一句提示词；剥掉它才是真正的查询词。
@@ -31,11 +30,11 @@ const searchQueryPrefix = "perform a web search for the query:"
 
 // searchRequest 请求体里我们认识的字段（两种形态的并集）。
 type searchRequest struct {
-	Query      string            `json:"query"`
-	MaxResults int               `json:"max_results"`
-	MaxResultsCamel int          `json:"maxResults"`
-	Model      string            `json:"model"`
-	Messages   []json.RawMessage `json:"messages"`
+	Query           string            `json:"query"`
+	MaxResults      int               `json:"max_results"`
+	MaxResultsCamel int               `json:"maxResults"`
+	Model           string            `json:"model"`
+	Messages        []json.RawMessage `json:"messages"`
 }
 
 // searchBlock Anthropic content block 的最小形态：只要 text 就够了。
@@ -75,7 +74,7 @@ func (h *Handler) searchMessages(w http.ResponseWriter, r *http.Request) {
 		maxResults = req.MaxResultsCamel
 	}
 
-	// 选号轮转：搜索失败换号重试，与聊天同口径（MaxRotate 次）。
+	// 选号轮转：与 chat 同口径（MaxRotate 次），每轮纯轮换、不粘性。
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -87,29 +86,31 @@ func (h *Handler) searchMessages(w http.ResponseWriter, r *http.Request) {
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			continue
 		}
-		results, err := h.cfg.Upstream.Search(acct, query, maxResults)
+		resp, err := h.cfg.Upstream.AgentToolSearch(r.Context(), acct, upstream.AgentToolSearchRequest{
+			Query:      query,
+			Type:       "text2text",
+			MaxResults: maxResults,
+		})
 		h.cfg.Pool.Release(acct.UID)
 		if err != nil {
 			lastErr = err
-			// 这里**不**写冷却：搜索失败（尤其是请求级 4xx）不代表账号不能聊天，
-			// 罚号会把一条搜索错误放大成聊天 503。换号重试已经足够。
+			// 搜索失败（尤其请求级 4xx）不代表账号不能聊天，这里**不写冷却**，
+			// 只换号重试。配额类（15001）的冷却由上游 /v1/tools/search 负责。
 			continue
 		}
-		writeSearchMessages(w, req.Model, results)
+		if resp.Code != 0 {
+			lastErr = &upstream.Error{Status: http.StatusBadGateway, Msg: resp.Msg}
+			continue
+		}
+		writeSearchMessages(w, req.Model, resp.Results)
 		return
 	}
 
 	status := http.StatusServiceUnavailable
 	msg := "no usable account for search"
 	if lastErr != nil {
-		var ue *upstream.Error
-		if errors.As(lastErr, &ue) && ue.Status > 0 {
-			status = http.StatusBadGateway
-			msg = ue.Error()
-		} else {
-			status = http.StatusBadGateway
-			msg = lastErr.Error()
-		}
+		status = http.StatusBadGateway
+		msg = lastErr.Error()
 	}
 	writeAnthropicError(w, status, "api_error", msg)
 }
@@ -163,7 +164,7 @@ func textOfContent(raw json.RawMessage) string {
 }
 
 // writeSearchMessages 输出 Anthropic Messages 形态的搜索结果。
-func writeSearchMessages(w http.ResponseWriter, model string, results []upstream.SearchResult) {
+func writeSearchMessages(w http.ResponseWriter, model string, results []upstream.AgentToolSearchResult) {
 	items := make([]map[string]any, 0, len(results))
 	for _, r := range results {
 		if r.URL == "" {
@@ -173,7 +174,7 @@ func writeSearchMessages(w http.ResponseWriter, model string, results []upstream
 		if r.Title != "" {
 			item["title"] = r.Title
 		}
-		// 上游给的是 snippet；Anthropic 的结果块没有 snippet 字段，但下游渲染会忽略
+		// 上游给的是 snippet；Anthropic 的结果块没有该字段，但下游渲染会忽略
 		// 未知键，带上它比丢掉信息更好。
 		if r.Snippet != "" {
 			item["snippet"] = r.Snippet

@@ -200,8 +200,11 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), largeUsed: make(map[string][]time.Time)}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// agenttool web search 透传（0057）：与 chat 同鉴权面；账号池轮转 +
+	// 15001 搜索配额软冷却（见 tool_search.go）。
+	h.mux.HandleFunc("POST /v1/tools/search", h.withAuth(h.toolSearch))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
-	// 联网搜索：把上游 agenttool 端点包成 Anthropic Messages 形态，供 dsh 的
+	// 联网搜索：把上游 agenttool 结果包成 Anthropic Messages 形态，供 dsh 的
 	// web-search-deepseek provider 直接接入（见 search.go）。
 	h.mux.HandleFunc("POST "+searchMessagesPath, h.withAuth(h.searchMessages))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
